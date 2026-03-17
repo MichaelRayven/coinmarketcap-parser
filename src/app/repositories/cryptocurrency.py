@@ -25,7 +25,6 @@ class CryptocurrencyRepository:
         stmt = stmt.on_conflict_do_update(
             index_elements=["slug"],
             set_={
-                "id": stmt.excluded.id,
                 "name": stmt.excluded.name,
                 "symbol": stmt.excluded.symbol,
                 "circulating_supply": stmt.excluded.circulating_supply,

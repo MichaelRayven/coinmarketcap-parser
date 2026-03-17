@@ -1,8 +1,8 @@
-"""Initial
+"""initial
 
-Revision ID: 25c27798420b
+Revision ID: 871a1cf7b6fb
 Revises:
-Create Date: 2026-03-17 13:09:02.188133
+Create Date: 2026-03-18 01:57:49.958378
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = "25c27798420b"
+revision: str = "871a1cf7b6fb"
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -33,9 +33,7 @@ def upgrade() -> None:
         sa.Column("usd_market_cap", sa.Float(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        op.f("ix_cryptocurrencies_slug"), "cryptocurrencies", ["slug"], unique=True
-    )
+    op.create_index(op.f("ix_cryptocurrencies_slug"), "cryptocurrencies", ["slug"], unique=True)
     # ### end Alembic commands ###
 
 

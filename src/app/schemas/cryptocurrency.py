@@ -2,7 +2,6 @@ from pydantic import BaseModel, ConfigDict
 
 
 class CryptocurrencyResponse(BaseModel):
-    id: int
     name: str
     symbol: str
     slug: str

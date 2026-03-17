@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from app.api.routes import router
 from app.core.database import AsyncSessionLocal
 from app.services.parser import CoinMarketCapParser
-from app.services.repository import CryptocurrencyRepository
+from app.repositories.cryptocurrency import CryptocurrencyRepository
 
 
 @asynccontextmanager

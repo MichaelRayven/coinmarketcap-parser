@@ -1,18 +1,24 @@
+import logging
 import asyncio
 import re
 from typing import List
 
-import httpx
+from httpx import AsyncClient
 from bs4 import BeautifulSoup
 
 from app.core.config.settings import settings
 from app.schemas.cryptocurrency import CryptocurrencyResponse
 
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
 class CoinMarketCapParser:
     def __init__(self):
         self.base_url = settings.cmc_api_url.rstrip("/")
         self.limit = settings.cmc_limit
+        self.concurrency = settings.concurrency
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -20,123 +26,125 @@ class CoinMarketCapParser:
         }
 
     def _parse_currency_amount(self, text: str | None) -> float | None:
-        """Parses a string like '$73,951.40' or '1,200,300 BTC' to float."""
+        """Parses a string like '$73,951.40', '$1.48T', or '1,200,300 BTC' to float."""
         if not text:
             return None
-        # Remove anything except digits and dot
-        cleaned = re.sub(r"[^\d.]", "", text)
+
+        # Clean the string but keep the decimal point and multiplier letters
+        cleaned = text.strip().replace("$", "").replace(",", "")
+
+        # Handle multipliers if present (T=Trillion, B=Billion, M=Million)
+        multipliers = {"T": 1e12, "B": 1e9, "M": 1e6}
+        suffix = cleaned[-1].upper() if cleaned else ""
+
         try:
-            return float(cleaned)
-        except ValueError:
+            if suffix in multipliers:
+                val = float(re.sub(r"[^\d.]", "", cleaned[:-1]))
+                return val * multipliers[suffix]
+
+            # Standard numeric extraction
+            val_str = re.sub(r"[^\d.]", "", cleaned)
+            return float(val_str) if val_str else None
+        except (ValueError, IndexError):
             return None
+
+    def _normalize_string(self, text: str) -> str:
+        return text.split("/")[0].strip().lower()
+
+    def _parse_slugs_from_html(self, html: str, limit: int) -> List[str]:
+        """Parses the top-N cryptocurrency slugs from the CMC homepage HTML."""
+        soup = BeautifulSoup(html, "html.parser")
+        slugs: list[str] = []
+        for a_tag in soup.select('a[href^="/currencies/"]'):
+            href = str(a_tag.get("href", ""))
+            parts = [p for p in href.split("/") if p]
+            if len(parts) >= 2 and parts[0] == "currencies":
+                slug = parts[1]
+                if slug not in slugs and not slug.startswith("coinmarketcap"):
+                    slugs.append(slug)
+        return slugs[:limit]
+
+    def _parse_coin_from_html(self, html: str, slug: str) -> CryptocurrencyResponse:
+        """Parses a single coin's data from its CMC detail page HTML."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Header Data (Price, Name, Symbol)
+        price_el = soup.find(attrs={"data-test": "text-cdp-price-display"})
+        usd_price = self._parse_currency_amount(price_el.text if price_el else None)
+
+        name_el = soup.find(attrs={"data-role": "coin-name"}) or soup.find(
+            attrs={"data-test": "coin-name"}
+        )
+        name_str = name_el.text.strip().replace(" price", "") if name_el else slug.capitalize()
+
+        symbol_el = soup.find(attrs={"data-role": "coin-symbol"})
+        symbol_str = symbol_el.text.strip() if symbol_el else slug.upper()
+
+        # 2. Extract Metrics
+        metrics_data = {"market cap": 0.0, "circulating_supply": 0.0}
+
+        metric_groups = soup.select('[data-test="section-coin-metrics"] [data-role="group-item"]')
+        for group in metric_groups:
+            title_el = group.select_one("dt")
+            value_el = group.select_one("dd")
+
+            if title_el and value_el:
+                title_text = self._normalize_string(title_el.text)
+                # Strip nested elements (like tooltips or secondary values) for cleaner parsing
+                value_text = self._normalize_string(value_el.get_text(separator="/"))
+
+                if "market cap" in title_text and "diluted" not in title_text:
+                    metrics_data["market cap"] = self._parse_currency_amount(value_text) or 0.0
+                elif "circulating supply" in title_text:
+                    # CMC often puts the BTC/ETH amount first in Circulating Supply
+                    metrics_data["circulating_supply"] = (
+                        self._parse_currency_amount(value_text) or 0.0
+                    )
+
+        return CryptocurrencyResponse(
+            name=name_str,
+            symbol=symbol_str,
+            slug=slug,
+            circulating_supply=metrics_data["circulating_supply"],
+            usd_price=usd_price,
+            usd_market_cap=metrics_data["market cap"],
+        )
+
+    async def _fetch_slugs(self, client: AsyncClient) -> List[str]:
+        """Fetches the top cryptocurrency slugs."""
+        response = await client.get(self.base_url)
+        response.raise_for_status()
+        return self._parse_slugs_from_html(response.text, self.limit)
+
+    async def _fetch_cryptocurrency_data(
+        self, client: AsyncClient, slug: str
+    ) -> CryptocurrencyResponse:
+        """Fetches the information for a single cryptocurrency."""
+        coin_url = f"{self.base_url}/currencies/{slug}/"
+        response = await client.get(coin_url)
+        response.raise_for_status()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._parse_coin_from_html, response.text, slug)
 
     async def fetch_cryptocurrencies(self) -> List[CryptocurrencyResponse]:
         """Fetches the top cryptocurrencies by parsing coinmarketcap.com HTML."""
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
-            # 1. Fetch main page to get coin slugs
-            response = await client.get(self.base_url)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Find all links to currencies and extract slugs gracefully.
-            # E.g. href="/currencies/bitcoin/" -> "bitcoin"
-            slugs = []
-            for a_tag in soup.select('a[href^="/currencies/"]'):
-                href = a_tag.get("href", "")
-                parts = [p for p in href.split("/") if p]
-                if len(parts) >= 2 and parts[0] == "currencies":
-                    slug = parts[1]
-                    # Exclude general or aggregate index pages
-                    if slug not in slugs and not slug.startswith("coinmarketcap"):
-                        slugs.append(slug)
-
-            # Keep only the requested limit (e.g. Top 10)
-            slugs = slugs[: self.limit]
-
+        async with AsyncClient(headers=self.headers, timeout=30.0) as client:
+            slugs = await self._fetch_slugs(client)
             parsed_coins = []
 
-            # 2. Fetch and parse each individual coin page
-            for idx, slug in enumerate(slugs, start=1):
-                coin_url = f"{self.base_url}/currencies/{slug}/"
+            slug_chunks = [[] for _ in range(self.concurrency)]
+            for idx, slug in enumerate(slugs):
+                slug_chunks[idx % self.concurrency].append(slug)
+
+            async def process_slugs(slugs: list[str]):
                 try:
-                    coin_resp = await client.get(coin_url)
-                    coin_resp.raise_for_status()
-                    coin_soup = BeautifulSoup(coin_resp.text, "html.parser")
-
-                    # Extract Data using `data-test` per explicit request
-                    # price (e.g. data-test="text-cdp-price-display")
-                    price_el = coin_soup.find(
-                        attrs={"data-test": "text-cdp-price-display"}
-                    )
-                    usd_price = self._parse_currency_amount(
-                        price_el.text if price_el else None
-                    )
-
-                    # name (e.g. data-role="coin-name" or somewhere with data-test)
-                    name_el = coin_soup.find(
-                        attrs={"data-role": "coin-name"}
-                    ) or coin_soup.find(attrs={"data-test": "coin-name"})
-                    name_str = (
-                        name_el.text.strip().replace(" price", "")
-                        if name_el
-                        else slug.capitalize()
-                    )
-
-                    # symbol
-                    symbol_el = coin_soup.find(attrs={"data-role": "coin-symbol"})
-                    symbol_str = symbol_el.text.strip() if symbol_el else slug.upper()
-
-                    # market cap and circulating supply can be found generally in elements with data-test matching
-                    market_cap = None
-                    circulating_supply = None
-
-                    stats_dts = coin_soup.find_all("dd")
-                    # Usually order on CMC details page is roughly Market Cap, FDV, Vol, Circ. Supply.
-                    # We will do a generic parse of dd tags where we check previous dt siblings if data-test isn't reliable enough,
-                    # since data-test for these frequently change. But let's try to extract from dd directly.
-                    # As a safe fallback because data-test exact matches change, we parse dd texts which usually contain $ and B/M etc.
-                    # Let's try locating them specifically:
-                    for tag in coin_soup.find_all(attrs={"data-test": True}):
-                        test_str = tag.get("data-test", "").lower()
-                        if "market-cap" in test_str or "marketcap" in test_str:
-                            val = self._parse_currency_amount(tag.text)
-                            if val and val > 1000000:  # heuristic
-                                market_cap = val
-
-                    # If we couldn't find market_cap via data-test specifically, we rely on standard page structure (dt/dd)
-                    if not market_cap:
-                        # Find element containing 'Market cap' text
-                        for dt in coin_soup.find_all("dt"):
-                            if "market cap" in dt.text.lower():
-                                dd = dt.find_next_sibling("dd")
-                                if dd:
-                                    market_cap = self._parse_currency_amount(
-                                        dd.text.split(" ")[0]
-                                    )  # e.g. "$1.48T" -> 1.48 * 1T? No, our parser ignores T.
-                                    # Actually, our _parse_currency_amount strips T/B/M. CMC shows fully expanded numbers on hover or inside text.
-                                    # To be robust, we'll try to find the full number.
-
-                    # CMC provides absolute numbers inside specific span tags or we can clean up standard text.
-                    # For simplicity, if CMC page says "$1.40T", float() on "1.40" is 1.4, which is technically wrong scale,
-                    # but since parsing HTML completely cleanly is brittle, we'll extract raw numbers.
-
-                    # A better way for CMC is getting the 'baseLabel' style spans or just the text
-
-                    crypto = CryptocurrencyResponse(
-                        id=idx,  # Assign ID by rank order
-                        name=name_str,
-                        symbol=symbol_str,
-                        slug=slug,
-                        circulating_supply=0.0,  # Will refine actual values next
-                        usd_price=usd_price,
-                        usd_market_cap=0.0,
-                    )
-                    parsed_coins.append(crypto)
-
-                    # Small delay to prevent rate-limiting
-                    await asyncio.sleep(0.5)
+                    for slug in slugs:
+                        result = await self._fetch_cryptocurrency_data(client, slug)
+                        parsed_coins.append(result)
                 except Exception as e:
-                    print(f"Error fetching {slug}: {e}")
+                    logger.error(f"Error fetching {slug}: {e}")
+
+            tasks = [process_slugs(chunk) for chunk in slug_chunks]
+            await asyncio.gather(*tasks)
 
             return parsed_coins
