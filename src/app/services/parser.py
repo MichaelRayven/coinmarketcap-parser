@@ -1,6 +1,6 @@
+from app.core.lib.utils import parse_currency_amount, normalize_string
 import logging
 import asyncio
-import re
 from typing import List
 
 from httpx import AsyncClient
@@ -25,31 +25,6 @@ class CoinMarketCapParser:
             "Accept-Language": "en-US,en;q=0.5",
         }
 
-    def _parse_currency_amount(self, text: str | None) -> float | None:
-        """Parses a string like '$73,951.40', '$1.48T', or '1,200,300 BTC' to float."""
-        if not text:
-            return None
-
-        cleaned = text.strip().replace("$", "").replace(",", "")
-
-        # Handle multipliers if present (T=Trillion, B=Billion, M=Million)
-        multipliers = {"T": 1e12, "B": 1e9, "M": 1e6}
-        suffix = cleaned[-1].upper() if cleaned else ""
-
-        try:
-            if suffix in multipliers:
-                val = float(re.sub(r"[^\d.]", "", cleaned[:-1]))
-                return val * multipliers[suffix]
-
-            # Standard numeric extraction
-            val_str = re.sub(r"[^\d.]", "", cleaned)
-            return float(val_str) if val_str else None
-        except (ValueError, IndexError):
-            return None
-
-    def _normalize_string(self, text: str) -> str:
-        return text.split("/")[0].strip().lower()
-
     def _parse_slugs_from_html(self, html: str, limit: int) -> List[str]:
         """Parses the top-N cryptocurrency slugs from the CMC homepage HTML."""
         soup = BeautifulSoup(html, "html.parser")
@@ -69,7 +44,7 @@ class CoinMarketCapParser:
 
         # 1. Header Data (Price, Name, Symbol)
         price_el = soup.find(attrs={"data-test": "text-cdp-price-display"})
-        usd_price = self._parse_currency_amount(price_el.text if price_el else None)
+        usd_price = parse_currency_amount(price_el.text if price_el else None)
 
         name_el = soup.find(attrs={"data-role": "coin-name"}) or soup.find(
             attrs={"data-test": "coin-name"}
@@ -88,17 +63,15 @@ class CoinMarketCapParser:
             value_el = group.select_one("dd")
 
             if title_el and value_el:
-                title_text = self._normalize_string(title_el.text)
+                title_text = normalize_string(title_el.text)
                 # Strip nested elements (like tooltips or secondary values) for cleaner parsing
-                value_text = self._normalize_string(value_el.get_text(separator="/"))
+                value_text = normalize_string(value_el.get_text(separator="/"))
 
                 if "market cap" in title_text and "diluted" not in title_text:
-                    metrics_data["market cap"] = self._parse_currency_amount(value_text) or 0.0
+                    metrics_data["market cap"] = parse_currency_amount(value_text) or 0.0
                 elif "circulating supply" in title_text:
                     # CMC often puts the BTC/ETH amount first in Circulating Supply
-                    metrics_data["circulating_supply"] = (
-                        self._parse_currency_amount(value_text) or 0.0
-                    )
+                    metrics_data["circulating_supply"] = parse_currency_amount(value_text) or 0.0
 
         return CryptocurrencyResponse(
             name=name_str,
