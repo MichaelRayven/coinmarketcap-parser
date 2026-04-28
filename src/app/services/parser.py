@@ -30,7 +30,6 @@ class CoinMarketCapParser:
         if not text:
             return None
 
-        # Clean the string but keep the decimal point and multiplier letters
         cleaned = text.strip().replace("$", "").replace(",", "")
 
         # Handle multipliers if present (T=Trillion, B=Billion, M=Million)
