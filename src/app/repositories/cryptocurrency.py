@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
-from app.pages.cryptocurrency import Cryptocurrency
+from app.models.cryptocurrency import Cryptocurrency
 from app.schemas.cryptocurrency import CryptocurrencyResponse
 
 
